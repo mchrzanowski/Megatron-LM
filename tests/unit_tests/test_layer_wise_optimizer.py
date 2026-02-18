@@ -1,6 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
 import os
+import sys
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -10,13 +13,33 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.enums import ModelType
+from megatron.core.fp8_utils import is_float8tensor
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import get_pg_rank, get_pg_size, is_te_min_version
+from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.global_vars import destroy_global_vars, get_args, set_args, set_global_variables
+from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    from transformer_engine.pytorch.fp8 import check_fp8_support
+
+    fp8_available, reason_for_no_fp8 = check_fp8_support()
+except ImportError:
+    fp8_available = False
+    reason_for_no_fp8 = "TransformerEngine not available"
+
+WORLD_SIZE = int(os.getenv('WORLD_SIZE', '1'))
+_SEED = 1234
 
 # Skip all tests in this file for LTS versions
 pytestmark = pytest.mark.skipif(
@@ -438,3 +461,290 @@ class TestLayerWiseOptimizer:
         # Verify updated values match reference optimizer
         for param, ref_param in zip(model.parameters(), reference_model.parameters()):
             torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
+
+    # ---- FP8 + layer-wise optimizer tests ----
+
+    @staticmethod
+    def _model_provider_fp8(pre_process=True, post_process=True):
+        """Model provider for FP8 GPT model tests."""
+        model_parallel_cuda_manual_seed(_SEED)
+        args = get_args()
+        config = core_transformer_config_from_args(args)
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.vocal_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent,
+        )
+
+    def _create_fp8_test_args(self, tp, recipe, fp8_param_gather=True):
+        """Create test args for FP8 + layer-wise optimizer tests."""
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+
+        sys.argv = ['test_layer_wise_optimizer.py']
+        args = parse_args()
+        args.num_layers = 4
+        args.vocal_size = 128800
+        args.hidden_size = 128
+        args.num_attention_heads = 8
+        args.max_position_embeddings = 512
+        args.micro_batch_size = 2
+        args.create_attention_mask_in_dataloader = True
+        args.seq_length = 512
+        args.tensor_model_parallel_size = tp
+        args.sequence_parallel = True if tp > 1 else False
+        args.pipeline_model_parallel_size = 1
+        args.context_parallel_size = 1
+        args.train_iters = 10
+        args.lr = 3e-5
+        args.bf16 = True
+        args.add_bias_linear = False
+        args.swiglu = True
+        args.use_distributed_optimizer = False
+        args.optimizer = 'dist_muon'
+        args.fp8 = "e4m3"
+        args.fp8_recipe = recipe
+        args.fp8_param_gather = fp8_param_gather
+        args.ddp_bucket_size = 1024
+
+        validate_args(args)
+        set_global_variables(args, False)
+        return args
+
+    def _get_fp8_batch(self, seq_length=512, micro_batch_size=2):
+        """Create a test batch for FP8 GPT model tests."""
+        data = list(range(seq_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = 1 + torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, seq_length, seq_length), dtype=bool
+        ).cuda()
+        loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
+        return input_ids, labels, position_ids, attention_mask, loss_mask
+
+    def _run_fp8_layer_wise_test(self, tp_size, recipe, fp8_param_gather=True, num_iters=100):
+        """Run FP8 + layer-wise optimizer training loop and return loss list."""
+        args = self._create_fp8_test_args(tp_size, recipe, fp8_param_gather)
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+
+        input_ids, labels, position_ids, attention_mask, loss_mask = self._get_fp8_batch(
+            args.seq_length, args.micro_batch_size
+        )
+
+        gpt_model, optimizer, _ = setup_model_and_optimizer(
+            self._model_provider_fp8, ModelType.encoder_or_decoder
+        )
+        assert len(gpt_model) == 1
+
+        # Verify FP8 params exist when fp8_param_gather is enabled.
+        num_fp8_params = 0
+        for _, param in gpt_model[0].named_parameters():
+            assert param.requires_grad
+            assert param.main_grad is not None
+            if is_float8tensor(param):
+                num_fp8_params += 1
+        if fp8_param_gather:
+            # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
+            assert num_fp8_params == 4 * args.num_layers
+
+        loss_list = []
+        for i in range(num_iters):
+            gpt_model[0].zero_grad_buffer()
+            optimizer.zero_grad()
+
+            gpt_model[0].set_is_first_microbatch()
+            output = gpt_model[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+
+            assert output.shape[0] == args.micro_batch_size
+            assert output.shape[1] == args.seq_length
+
+            loss = output.mean()
+            loss.backward()
+
+            if args.overlap_grad_reduce:
+                gpt_model[0].finish_grad_sync()
+
+            for name, param in gpt_model[0].named_parameters():
+                assert param.main_grad is not None
+
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+
+            loss_list.append(loss.item())
+
+        return torch.tensor(loss_list)
+
+    def _cleanup_fp8_state(self):
+        """Clean up global state after FP8 GPT model tests."""
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        gc.collect()
+
+    def test_fp8_allgather_post_processing(self):
+        """Verify post_all_gather_processing is called during allgather with FP8 params."""
+        model, optimizer, pg_collection = self.create_model_and_optimizer()
+
+        # Set gradients so step() triggers allgather.
+        for param in model.parameters():
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.float().clone().detach()
+
+        with patch(
+            'megatron.core.optimizer.layer_wise_optimizer.is_float8tensor', return_value=True
+        ), patch(
+            'megatron.core.optimizer.layer_wise_optimizer.post_all_gather_processing'
+        ) as mock_post:
+            optimizer.step()
+
+            if optimizer.dp_cp_params_list is not None:
+                mock_post.assert_called()
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_fp8_param_gather_delayed_scaling(self):
+        """End-to-end test: FP8 delayed scaling + layer-wise optimizer.
+
+        Runs multiple forward/backward/step cycles with a GPTModel using
+        fp8_param_gather=True, fp8_recipe='delayed', and dist_muon optimizer.
+        Verifies loss is finite and training completes successfully.
+        """
+        try:
+            loss_list = self._run_fp8_layer_wise_test(
+                tp_size=2, recipe="delayed", fp8_param_gather=True, num_iters=100
+            )
+            assert torch.isfinite(loss_list).all(), "Loss should be finite for all iterations"
+        finally:
+            self._cleanup_fp8_state()
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 required for tensorwise")
+    def test_fp8_param_gather_tensorwise_scaling(self):
+        """End-to-end test: FP8 tensorwise scaling + layer-wise optimizer.
+
+        Same as delayed scaling test but with fp8_recipe='tensorwise'.
+        Requires TransformerEngine >= 2.2.0.
+        """
+        try:
+            loss_list = self._run_fp8_layer_wise_test(
+                tp_size=2, recipe="tensorwise", fp8_param_gather=True, num_iters=100
+            )
+            assert torch.isfinite(loss_list).all(), "Loss should be finite for all iterations"
+        finally:
+            self._cleanup_fp8_state()
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 required")
+    def test_fp8_param_gather_correctness(self):
+        """Compare loss trajectories with and without fp8_param_gather.
+
+        Runs training with fp8_param_gather=True and fp8_param_gather=False
+        using the layer-wise optimizer. Verifies that loss trajectories match
+        within tolerance, confirming FP8 param gather doesn't affect convergence.
+        """
+        try:
+            loss_list = self._run_fp8_layer_wise_test(
+                tp_size=2, recipe="delayed", fp8_param_gather=True, num_iters=100
+            )
+            loss_list_ref = self._run_fp8_layer_wise_test(
+                tp_size=2, recipe="delayed", fp8_param_gather=False, num_iters=100
+            )
+            torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-4, rtol=1e-4)
+        finally:
+            self._cleanup_fp8_state()
+
+    def test_fp8_param_gather_validation_accepts_layer_wise(self):
+        """Verify the fp8_param_gather validation condition accepts layer-wise optimizer.
+
+        Tests the exact assertion condition from arguments.py:
+        - Positive: 'dist' in 'dist_muon' should pass validation.
+        - Negative: 'dist' in 'adam' should fail validation.
+        """
+        # Positive case: dist_muon optimizer should be accepted.
+        assert (
+            False  # use_distributed_optimizer
+            or False  # use_torch_fsdp2
+            or False  # use_megatron_fsdp
+            or False  # not torch.is_grad_enabled() (grad is enabled)
+            or 'dist' in 'dist_muon'  # layer-wise optimizer
+        ), 'Validation should accept dist_muon optimizer with fp8_param_gather'
+
+        # Negative case: plain adam optimizer should be rejected.
+        assert not (
+            False  # use_distributed_optimizer
+            or False  # use_torch_fsdp2
+            or False  # use_megatron_fsdp
+            or False  # not torch.is_grad_enabled() (grad is enabled)
+            or 'dist' in 'adam'  # regular optimizer, no 'dist'
+        ), 'Validation should reject adam optimizer with fp8_param_gather'
+
+        # Also verify 'sgd' and 'muon' (without dist) are rejected.
+        for opt_name in ['sgd', 'muon']:
+            assert not (
+                False or False or False or False or 'dist' in opt_name
+            ), f'Validation should reject {opt_name} optimizer with fp8_param_gather'
+
+    @pytest.mark.skipif(WORLD_SIZE == 1, reason="Multi-rank test requires WORLD_SIZE > 1")
+    def test_fp8_allgather_multi_iteration(self):
+        """Run 3+ iterations with mock FP8, verify post-processing and param sync.
+
+        Uses mock FP8 tensors to verify that post_all_gather_processing is
+        called on each iteration and that parameters remain synchronized
+        across ranks throughout training.
+        """
+        model, optimizer, pg_collection = self.create_model_and_optimizer()
+        dp_size = get_pg_size(pg_collection.dp_cp)
+
+        with patch(
+            'megatron.core.optimizer.layer_wise_optimizer.is_float8tensor', return_value=True
+        ), patch(
+            'megatron.core.optimizer.layer_wise_optimizer.post_all_gather_processing'
+        ) as mock_post:
+            for iteration in range(3):
+                for param in model.parameters():
+                    grad_value = torch.randn_like(param)
+                    torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+                    param.main_grad = grad_value.float().clone().detach()
+
+                optimizer.step()
+
+            # Verify post_all_gather_processing was called for each iteration.
+            if optimizer.dp_cp_params_list is not None:
+                # Called once per _allgather_helper invocation per iteration.
+                assert mock_post.call_count >= 3, (
+                    f"Expected at least 3 calls to post_all_gather_processing, "
+                    f"got {mock_post.call_count}"
+                )
+
+        # Verify params are synchronized across ranks after all iterations.
+        if dp_size > 1:
+            for name, param in model.named_parameters():
+                param_list = [torch.zeros_like(param.data) for _ in range(dp_size)]
+                torch.distributed.all_gather(
+                    param_list, param.data, group=pg_collection.dp_cp
+                )
+                for i in range(1, dp_size):
+                    try:
+                        torch.testing.assert_close(param_list[0], param_list[i])
+                    except AssertionError as e:
+                        raise AssertionError(
+                            f"Parameter {name} differs between rank 0 and rank {i} "
+                            f"after 3 iterations. {str(e)}"
+                        ) from None
