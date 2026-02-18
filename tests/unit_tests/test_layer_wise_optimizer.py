@@ -674,32 +674,28 @@ class TestLayerWiseOptimizer:
         """Verify the fp8_param_gather validation condition accepts layer-wise optimizer.
 
         Tests the exact assertion condition from arguments.py:
-        - Positive: 'dist' in 'dist_muon' should pass validation.
-        - Negative: 'dist' in 'adam' should fail validation.
+        - Positive: 'dist_muon' and 'dist_mop' should pass validation.
+        - Negative: 'adam', 'sgd', 'muon' should fail validation.
         """
-        # Positive case: dist_muon optimizer should be accepted.
-        assert (
-            False  # use_distributed_optimizer
-            or False  # use_torch_fsdp2
-            or False  # use_megatron_fsdp
-            or False  # not torch.is_grad_enabled() (grad is enabled)
-            or 'dist' in 'dist_muon'  # layer-wise optimizer
-        ), 'Validation should accept dist_muon optimizer with fp8_param_gather'
+        def _check_condition(optimizer_name):
+            return (
+                False  # use_distributed_optimizer
+                or False  # use_torch_fsdp2
+                or False  # use_megatron_fsdp
+                or False  # not torch.is_grad_enabled() (grad is enabled)
+                or optimizer_name in ('dist_muon', 'dist_mop')
+            )
 
-        # Negative case: plain adam optimizer should be rejected.
-        assert not (
-            False  # use_distributed_optimizer
-            or False  # use_torch_fsdp2
-            or False  # use_megatron_fsdp
-            or False  # not torch.is_grad_enabled() (grad is enabled)
-            or 'dist' in 'adam'  # regular optimizer, no 'dist'
-        ), 'Validation should reject adam optimizer with fp8_param_gather'
+        # Positive cases: layer-wise optimizers should be accepted.
+        assert _check_condition('dist_muon'), \
+            'Validation should accept dist_muon optimizer with fp8_param_gather'
+        assert _check_condition('dist_mop'), \
+            'Validation should accept dist_mop optimizer with fp8_param_gather'
 
-        # Also verify 'sgd' and 'muon' (without dist) are rejected.
-        for opt_name in ['sgd', 'muon']:
-            assert not (
-                False or False or False or False or 'dist' in opt_name
-            ), f'Validation should reject {opt_name} optimizer with fp8_param_gather'
+        # Negative cases: non-layer-wise optimizers should be rejected.
+        for opt_name in ['adam', 'sgd', 'muon']:
+            assert not _check_condition(opt_name), \
+                f'Validation should reject {opt_name} optimizer with fp8_param_gather'
 
     @pytest.mark.skipif(WORLD_SIZE == 1, reason="Multi-rank test requires WORLD_SIZE > 1")
     def test_fp8_allgather_multi_iteration(self):

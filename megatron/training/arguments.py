@@ -736,7 +736,7 @@ def validate_args(args, defaults={}):
             or args.use_torch_fsdp2
             or args.use_megatron_fsdp
             or not torch.is_grad_enabled()
-            or 'dist' in getattr(args, 'optimizer', '')
+            or getattr(args, 'optimizer', '') in ('dist_muon', 'dist_mop')
         ), '--fp8-param-gather only supported with distributed optimizer, layer-wise optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
     # FP4 and FP8 are mutually exclusive
