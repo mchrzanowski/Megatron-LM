@@ -8,6 +8,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
+from megatron.core.fp8_utils import is_float8tensor, post_all_gather_processing
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size
 
@@ -173,6 +174,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 updated_params = _unflatten_dense_tensors(flat_params, params)
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
+
+            # FP8 post-processing: create transposed views etc. for Float8Tensor params.
+            fp8_params = []
+            for params in params_list:
+                for p in params:
+                    if is_float8tensor(p):
+                        fp8_params.append(p)
+            if fp8_params:
+                post_all_gather_processing(fp8_params)
 
         if self.pg_collection is None:
             return
