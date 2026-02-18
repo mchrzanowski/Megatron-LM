@@ -731,8 +731,13 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
 
     if args.fp8_param_gather:
-        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
-            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
+        assert (
+            args.use_distributed_optimizer
+            or args.use_torch_fsdp2
+            or args.use_megatron_fsdp
+            or not torch.is_grad_enabled()
+            or 'dist' in getattr(args, 'optimizer', '')
+        ), '--fp8-param-gather only supported with distributed optimizer, layer-wise optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
     # FP4 and FP8 are mutually exclusive
     if args.fp4 and args.fp8:
