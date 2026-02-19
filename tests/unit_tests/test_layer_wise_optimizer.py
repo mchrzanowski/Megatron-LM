@@ -787,6 +787,123 @@ class TestLayerWiseOptimizer:
         finally:
             self._cleanup_fp8_state()
 
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="TE 2.3.0 required for blockwise")
+    def test_fp8_param_gather_blockwise_correctness(self):
+        """Compare loss trajectories with and without fp8_param_gather using blockwise scaling.
+
+        This is the blockwise equivalent of test_fp8_param_gather_correctness.
+        A bug in allgather_params that fails to synchronize _rowwise_scale_inv would
+        cause loss divergence because remote ranks dequantize FP8 data with stale scales.
+        """
+        try:
+            loss_list = self._run_fp8_layer_wise_test(
+                tp_size=2, recipe="blockwise", fp8_param_gather=True, num_iters=100
+            )
+            loss_list_ref = self._run_fp8_layer_wise_test(
+                tp_size=2, recipe="blockwise", fp8_param_gather=False, num_iters=100
+            )
+            torch.testing.assert_close(loss_list, loss_list_ref, atol=0.01, rtol=1e-3)
+        finally:
+            self._cleanup_fp8_state()
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="TE 2.3.0 required for blockwise")
+    def test_fp8_blockwise_allgather_syncs_scales(self):
+        """Verify _rowwise_scale_inv is synchronized across DP ranks after allgather.
+
+        Directly tests for the bug where allgather_params only gathers raw FP8
+        data bytes (_rowwise_data) but not the per-block quantization scales
+        (_rowwise_scale_inv). Without scale sync, remote ranks dequantize FP8 data
+        with stale/incorrect scales, causing systematic numerical errors.
+        """
+        try:
+            args = self._create_fp8_test_args(
+                tp=2, recipe="blockwise", fp8_param_gather=True
+            )
+            set_args(args)
+            torch.manual_seed(_SEED)
+            Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+
+            input_ids, labels, position_ids, attention_mask, loss_mask = self._get_fp8_batch(
+                args.seq_length, args.micro_batch_size
+            )
+
+            gpt_model = get_model(self._model_provider_fp8, ModelType.encoder_or_decoder)
+            assert len(gpt_model) == 1
+
+            optimizer_config = OptimizerConfig(
+                optimizer='adam',
+                lr=args.lr,
+                bf16=False,
+                use_distributed_optimizer=False,
+            )
+            base_optimizer = get_megatron_optimizer(optimizer_config, gpt_model)
+            optimizer_config.bf16 = True
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+                with_context_parallel=True
+            )
+            pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+            optimizer = LayerWiseDistributedOptimizer(
+                base_optimizer.chained_optimizers, optimizer_config, pg_collection
+            )
+
+            dp_group = pg_collection.dp_cp
+            dp_size = get_pg_size(dp_group)
+            if dp_size <= 1:
+                pytest.skip("Scale sync test requires dp_size > 1")
+
+            num_iters = 5
+            for i in range(num_iters):
+                gpt_model[0].zero_grad_buffer()
+                optimizer.zero_grad()
+
+                gpt_model[0].set_is_first_microbatch()
+                output = gpt_model[0].forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                )
+
+                loss = output.mean()
+                loss.backward()
+
+                if args.overlap_grad_reduce:
+                    gpt_model[0].finish_grad_sync()
+
+                update_successful, _, _ = optimizer.step()
+                assert update_successful
+
+                # After allgather, verify _rowwise_scale_inv is identical across DP ranks.
+                for name, param in gpt_model[0].named_parameters():
+                    if not is_float8tensor(param):
+                        continue
+                    if (
+                        not hasattr(param, '_rowwise_scale_inv')
+                        or param._rowwise_scale_inv is None
+                    ):
+                        continue
+
+                    scale_inv = param._rowwise_scale_inv.contiguous()
+                    gathered = [torch.zeros_like(scale_inv) for _ in range(dp_size)]
+                    torch.distributed.all_gather(gathered, scale_inv, group=dp_group)
+
+                    for rank_idx in range(1, dp_size):
+                        try:
+                            torch.testing.assert_close(
+                                gathered[0], gathered[rank_idx], rtol=0, atol=0
+                            )
+                        except AssertionError as e:
+                            raise AssertionError(
+                                f"Iteration {i}: _rowwise_scale_inv for {name} differs "
+                                f"between rank 0 and rank {rank_idx}. {str(e)}"
+                            ) from None
+        finally:
+            self._cleanup_fp8_state()
+
 
 class TestGetRawDataHelper:
     """Test the _get_raw_data helper used by allgather_params.
