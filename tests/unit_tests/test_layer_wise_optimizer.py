@@ -767,3 +767,187 @@ class TestLayerWiseOptimizer:
                             f"Parameter {name} differs between rank 0 and rank {i} "
                             f"after 3 iterations. {str(e)}"
                         ) from None
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="TE 2.3.0 required for blockwise")
+    def test_fp8_param_gather_blockwise_scaling(self):
+        """End-to-end test: FP8 blockwise scaling + layer-wise optimizer.
+
+        This test exercises the exact code path that fails if _flatten_dense_tensors
+        is called directly on Float8BlockwiseQTensor objects: the allgather_params
+        path must extract raw data from FP8 blockwise tensors before flattening.
+
+        Requires TransformerEngine >= 2.3.0 for blockwise scaling support.
+        """
+        try:
+            loss_list = self._run_fp8_layer_wise_test(
+                tp_size=2, recipe="blockwise", fp8_param_gather=True, num_iters=100
+            )
+            assert torch.isfinite(loss_list).all(), "Loss should be finite for all iterations"
+        finally:
+            self._cleanup_fp8_state()
+
+
+class TestGetRawDataHelper:
+    """Test the _get_raw_data helper used by allgather_params.
+
+    These tests verify that raw data extraction works correctly for different
+    tensor types, ensuring _flatten_dense_tensors never sees FP8 quantized
+    tensor wrappers that don't support view/reshape.
+    """
+
+    def test_regular_tensor_returns_data(self):
+        """_get_raw_data on a plain tensor should return its .data."""
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        t = torch.randn(4, 4, device='cuda', dtype=torch.bfloat16)
+        # Access the nested helper via a minimal instance or call the logic directly.
+        # Since _get_raw_data is defined inside allgather_params, we replicate its logic here
+        # to unit-test it in isolation.
+        from megatron.core.fp8_utils import is_float8tensor
+
+        def _get_raw_data(p):
+            if is_float8tensor(p):
+                if hasattr(p, '_rowwise_data') and p._rowwise_data is not None:
+                    return p._rowwise_data
+                elif hasattr(p, '_data'):
+                    return p._data
+            return p.data
+
+        result = _get_raw_data(t)
+        assert result.data_ptr() == t.data.data_ptr(), "Should return the same underlying storage"
+        assert result.shape == t.shape
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="TE 2.3.0 required for blockwise")
+    def test_fp8_blockwise_tensor_returns_rowwise_data(self):
+        """_get_raw_data on a Float8BlockwiseQTensor should return _rowwise_data.
+
+        This is the critical test: it verifies that the raw uint8 rowwise data
+        buffer is returned instead of the quantized tensor wrapper, so that
+        _flatten_dense_tensors (which uses view) will succeed.
+        """
+        from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
+            Float8BlockQuantizer,
+            Float8BlockwiseQTensor,
+        )
+        from transformer_engine_torch import DType as TE_DType
+        from megatron.core.fp8_utils import is_float8tensor
+
+        def _get_raw_data(p):
+            if is_float8tensor(p):
+                if hasattr(p, '_rowwise_data') and p._rowwise_data is not None:
+                    return p._rowwise_data
+                elif hasattr(p, '_data'):
+                    return p._data
+            return p.data
+
+        # Create a quantizer and quantize a bf16 tensor into FP8 blockwise format.
+        quantizer = Float8BlockQuantizer(
+            fp8_dtype=TE_DType.kFloat8E4M3,
+            rowwise=True,
+            columnwise=False,
+        )
+        src = torch.randn(128, 128, device='cuda', dtype=torch.bfloat16)
+        fp8_tensor = quantizer.quantize_impl(src)
+
+        assert isinstance(fp8_tensor, Float8BlockwiseQTensor), (
+            f"Expected Float8BlockwiseQTensor, got {type(fp8_tensor)}"
+        )
+        assert is_float8tensor(fp8_tensor), "is_float8tensor should return True"
+
+        raw = _get_raw_data(fp8_tensor)
+        assert isinstance(raw, torch.Tensor), "Should return a plain torch.Tensor"
+        assert not isinstance(raw, Float8BlockwiseQTensor), (
+            "Should NOT return a Float8BlockwiseQTensor"
+        )
+        assert raw.dtype == torch.uint8, f"Raw FP8 data should be uint8, got {raw.dtype}"
+        assert raw is fp8_tensor._rowwise_data, "Should return the _rowwise_data buffer"
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="TE 2.3.0 required for blockwise")
+    def test_flatten_dense_tensors_on_fp8_blockwise_raw_data(self):
+        """Verify _flatten_dense_tensors works on raw data extracted from FP8 blockwise tensors.
+
+        This directly tests the fix: previously, calling _flatten_dense_tensors on
+        Float8BlockwiseQTensor raised NotImplementedError because view is not
+        supported. After extracting raw data, flatten should work.
+        """
+        from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+        from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
+            Float8BlockQuantizer,
+            Float8BlockwiseQTensor,
+        )
+        from transformer_engine_torch import DType as TE_DType
+        from megatron.core.fp8_utils import is_float8tensor
+
+        def _get_raw_data(p):
+            if is_float8tensor(p):
+                if hasattr(p, '_rowwise_data') and p._rowwise_data is not None:
+                    return p._rowwise_data
+                elif hasattr(p, '_data'):
+                    return p._data
+            return p.data
+
+        quantizer = Float8BlockQuantizer(
+            fp8_dtype=TE_DType.kFloat8E4M3,
+            rowwise=True,
+            columnwise=False,
+        )
+
+        # Create multiple FP8 blockwise tensors of different shapes.
+        shapes = [(128, 256), (256, 128), (128, 128)]
+        fp8_tensors = []
+        for shape in shapes:
+            src = torch.randn(shape, device='cuda', dtype=torch.bfloat16)
+            fp8_tensors.append(quantizer.quantize_impl(src))
+
+        # Verify that _flatten_dense_tensors FAILS on the quantized tensors directly.
+        with pytest.raises(NotImplementedError, match="Changing shape with view not implemented"):
+            _flatten_dense_tensors(fp8_tensors)
+
+        # Verify that _flatten_dense_tensors SUCCEEDS on extracted raw data.
+        raw_tensors = [_get_raw_data(t) for t in fp8_tensors]
+        flat = _flatten_dense_tensors(raw_tensors)
+        assert flat.dtype == torch.uint8
+        assert flat.numel() == sum(t.numel() for t in raw_tensors)
+
+        # Verify round-trip: unflatten and compare.
+        unflat = _unflatten_dense_tensors(flat, raw_tensors)
+        for original, recovered in zip(raw_tensors, unflat):
+            torch.testing.assert_close(original, recovered)
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(
+        not is_te_min_version("2.2.0"), reason="TE 2.2.0 required for tensorwise"
+    )
+    def test_fp8_tensorwise_tensor_returns_raw_data(self):
+        """_get_raw_data on a Float8Tensor (tensorwise) should return _data."""
+        from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor
+        from megatron.core.fp8_utils import is_float8tensor
+
+        def _get_raw_data(p):
+            if is_float8tensor(p):
+                if hasattr(p, '_rowwise_data') and p._rowwise_data is not None:
+                    return p._rowwise_data
+                elif hasattr(p, '_data'):
+                    return p._data
+            return p.data
+
+        # Create a simple Float8Tensor using TE's quantizer.
+        try:
+            from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
+            from transformer_engine_torch import DType as TE_DType
+
+            quantizer = Float8Quantizer(TE_DType.kFloat8E4M3)
+            src = torch.randn(64, 64, device='cuda', dtype=torch.bfloat16)
+            fp8_tensor = quantizer.quantize_impl(src)
+        except (ImportError, TypeError):
+            pytest.skip("Could not create Float8Tensor with current TE version")
+
+        assert is_float8tensor(fp8_tensor), "is_float8tensor should return True"
+
+        raw = _get_raw_data(fp8_tensor)
+        assert isinstance(raw, torch.Tensor)
+        assert not isinstance(raw, Float8Tensor), "Should not return Float8Tensor wrapper"
+        assert raw.dtype == torch.uint8 or raw.dtype == torch.float8_e4m3fn

@@ -148,32 +148,59 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def allgather_params(self) -> None:
         """All-gather updated params from all ranks."""
 
+        def _get_raw_data(p):
+            """Get the raw underlying data tensor for a parameter.
+
+            For FP8 quantized tensors (e.g. Float8BlockwiseQTensor), we cannot call
+            _flatten_dense_tensors directly because it tries to view/reshape the tensor,
+            which is not supported for blockwise-scaled FP8 tensors. Instead, we extract
+            the raw FP8 data buffer which is a regular torch.Tensor.
+            """
+            if is_float8tensor(p):
+                # TE 2.x blockwise tensors use _rowwise_data; TE 2.x tensorwise use _data.
+                if hasattr(p, '_rowwise_data') and p._rowwise_data is not None:
+                    return p._rowwise_data
+                elif hasattr(p, '_data'):
+                    return p._data
+            return p.data
+
         # helper function to flatten local params, allgather, unflatten and copy to model params
         def _allgather_helper(params_list, group):
             # flatten this rank's params and create empty tensor output list
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
             rank = get_pg_rank(group)
+
+            # Extract raw data tensors to avoid view issues with FP8 quantized tensors
+            raw_data_list = [
+                [_get_raw_data(p) for p in params] for params in params_list
+            ]
+
+            device = raw_data_list[0][0].device
+            dtype = raw_data_list[0][0].dtype
+
             # for rank without params create empty tensor and participate in allgather
             src = (
-                _flatten_dense_tensors(params_list[rank])
-                if len(params_list[rank]) > 0
+                _flatten_dense_tensors(raw_data_list[rank])
+                if len(raw_data_list[rank]) > 0
                 else torch.empty(0, device=device, dtype=dtype)
             )
             output_list = [
-                torch.empty(sum([p.numel() for p in params]), device=device, dtype=dtype)
-                for params in params_list
+                torch.empty(
+                    sum([r.numel() for r in raw_params]), device=device, dtype=dtype
+                )
+                for raw_params in raw_data_list
             ]
             # single all_gather_v to collect all updated params
             torch.distributed.all_gather(output_list, src, group=group)
-            # unflatten and copy gathered params for each rank i
-            for idx, (flat_params, params) in enumerate(zip(output_list, params_list)):
+            # unflatten and copy gathered raw data for each rank i
+            for idx, (flat_params, raw_params) in enumerate(
+                zip(output_list, raw_data_list)
+            ):
                 # skip local params and empty tensors
-                if len(params) == 0 or idx == rank:
+                if len(raw_params) == 0 or idx == rank:
                     continue
-                updated_params = _unflatten_dense_tensors(flat_params, params)
-                for updated_p, model_p in zip(updated_params, params):
-                    model_p.data.copy_(updated_p)
+                updated_raw = _unflatten_dense_tensors(flat_params, raw_params)
+                for updated_r, raw_p in zip(updated_raw, raw_params):
+                    raw_p.copy_(updated_r)
 
             # FP8 post-processing: create transposed views etc. for Float8Tensor params.
             fp8_params = []
