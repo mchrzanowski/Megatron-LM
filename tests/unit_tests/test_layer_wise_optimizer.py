@@ -511,6 +511,7 @@ class TestLayerWiseOptimizer:
         args.add_bias_linear = False
         args.swiglu = True
         args.use_distributed_optimizer = False
+        # TODO: Replace adam with dist_muon once it is merged into main.
         args.optimizer = 'adam'
         args.fp8 = "e4m3"
         args.fp8_recipe = recipe
@@ -550,8 +551,8 @@ class TestLayerWiseOptimizer:
         gpt_model = get_model(self._model_provider_fp8, ModelType.encoder_or_decoder)
         assert len(gpt_model) == 1
 
-        # Create optimizer manually with adam + LayerWiseDistributedOptimizer
-        # (avoids the emerging_optimizers / dist_muon dependency).
+        # TODO: Replace with get_megatron_muon_optimizer(layer_wise_distributed_optimizer=True)
+        # once dist_muon is merged into main.
         optimizer_config = OptimizerConfig(
             optimizer='adam',
             lr=args.lr,
