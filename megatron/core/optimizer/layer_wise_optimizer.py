@@ -300,9 +300,38 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         )
 
     @torch.no_grad()
+    def _requantize_fp8_params(self) -> None:
+        """Re-quantize FP8 model params from their fp32 main params.
+
+        Float16OptimizerWithFloat16Params._copy_main_params_to_model_params uses
+        _multi_tensor_copy_this_to_that with multi_tensor_scale (an APEX CUDA kernel)
+        to copy fp32 main params back to model params. This kernel operates on raw data
+        pointers and bypasses QuantizedTensor.__torch_dispatch__, so it does not trigger
+        proper FP8 re-quantization. The result is that _rowwise_data and _rowwise_scale_inv
+        remain stale after the optimizer step.
+
+        This method properly re-quantizes FP8 params via QuantizedTensor.quantize_()
+        before the allgather, matching what DistributedOptimizer does via
+        quantize_param_shard / cast_master_weights_to_fp8.
+        """
+        for optimizer in self.chained_optimizers:
+            if not isinstance(optimizer, Float16OptimizerWithFloat16Params):
+                continue
+            for model_group, main_group in zip(
+                optimizer.float16_groups, optimizer.fp32_from_float16_groups
+            ):
+                for model_param, main_param in zip(model_group, main_group):
+                    if is_float8tensor(model_param):
+                        model_param.quantize_(main_param.data)
+
+    @torch.no_grad()
     def step(self):  # type: ignore[no-untyped-def]
         """step function for layer-wise optimizer."""
         update_successful, grad_norm, num_zeros_in_grad = super().step()
+
+        # Re-quantize FP8 params that were not properly updated by the
+        # generic _copy_main_params_to_model_params in the base optimizer.
+        self._requantize_fp8_params()
 
         # All gather updated params.
         self.allgather_params()
