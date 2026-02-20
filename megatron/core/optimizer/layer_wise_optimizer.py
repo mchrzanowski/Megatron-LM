@@ -202,6 +202,50 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for updated_r, raw_p in zip(updated_raw, raw_params):
                     raw_p.copy_(updated_r)
 
+            # Sync _rowwise_scale_inv for FP8 blockwise params.
+            # Each rank re-quantizes its shard with new scales after the optimizer step.
+            # The raw-data all-gather above syncs the uint8 bytes but not the float32
+            # per-block scales, so remote ranks would still hold stale scale_inv values.
+            # post_all_gather_processing derives _columnwise_scale_inv by transposing
+            # _rowwise_scale_inv, so only the latter needs to be synced here.
+            scale_lists = []
+            for params in params_list:
+                scales = []
+                for p in params:
+                    if (
+                        is_float8tensor(p)
+                        and hasattr(p, '_rowwise_scale_inv')
+                        and p._rowwise_scale_inv is not None
+                    ):
+                        scales.append(p._rowwise_scale_inv)
+                scale_lists.append(scales)
+
+            has_scales = any(len(s) > 0 for s in scale_lists)
+            if has_scales:
+                scale_dtype = torch.float32
+                src_scales = (
+                    _flatten_dense_tensors(scale_lists[rank])
+                    if len(scale_lists[rank]) > 0
+                    else torch.empty(0, device=device, dtype=scale_dtype)
+                )
+                scale_output_list = [
+                    torch.empty(
+                        sum(s.numel() for s in scales),
+                        device=device,
+                        dtype=scale_dtype,
+                    )
+                    for scales in scale_lists
+                ]
+                torch.distributed.all_gather(scale_output_list, src_scales, group=group)
+                for idx, (flat_scales, scales) in enumerate(
+                    zip(scale_output_list, scale_lists)
+                ):
+                    if len(scales) == 0 or idx == rank:
+                        continue
+                    updated_scales = _unflatten_dense_tensors(flat_scales, scales)
+                    for updated_s, orig_s in zip(updated_scales, scales):
+                        orig_s.copy_(updated_s)
+
             # FP8 post-processing: create transposed views etc. for Float8Tensor params.
             fp8_params = []
             for params in params_list:
